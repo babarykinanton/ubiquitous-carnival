@@ -1,0 +1,156 @@
+---
+- name: install Apache HTTPD and modules
+  tags:
+    - ipa-wwwdemo
+    - package-install
+    - network
+  package: name={{ item }} state=present
+  with_items:
+    - httpd
+    - ipsilon-client
+    - mod_ssl
+    - mod_wsgi
+    - mod_auth_gssapi
+    - mod_authnz_pam
+    - mod_intercept_form_submit
+    - mod_lookup_identity
+    - libsss_simpleifp
+    - sssd-dbus
+    - mod_session
+    - mod_auth_mellon
+    - mod_authnz_pam
+  when: package_install
+  notify:
+    - restart httpd
+    - restart sssd
+
+- name: Remove welcome.conf
+  tags:
+    - ipa-wwwdemo
+  file: dest=/etc/httpd/conf.d/welcome.conf state=absent
+  notify:
+    - restart httpd
+
+- name: Enable Apache HTTPD service
+  tags:
+    - ipa-wwwdemo
+  service: name=httpd.service enabled=yes
+
+- name: Create PAM service file for Apache example app
+  tags:
+    - ipa-wwwdemo
+  copy:
+    src=pam_websvc
+    dest=/etc/pam.d/websvc
+  notify:
+    - restart httpd
+
+- name: setsebool allow_httpd_mod_auth_pam on
+  tags:
+    - ipa-wwwdemo
+  seboolean: name=httpd_mod_auth_pam state=yes persistent=yes
+  notify:
+    - restart httpd
+
+- name: Template local scripts
+  tags:
+    - ipa-wwwdemo
+  become: no
+  local_action:
+    template
+    src={{ item }}
+    dest={{ ipa_script_dir }}/{{ item }}
+    mode=0755
+  run_once: true
+  with_items:
+    - ipa_demossh
+    - ipa_democheck
+
+- include: keytab.yml
+  when: deploy_service
+- include: cert.yml
+  when: deploy_service
+- include: undeploy.yml
+  when: undeploy_service
+- include: sssd_ifp.yml
+- include: ipaconf.yml
+- include: usermachine.yml
+- include: httpdconf.yml
+
+- name: Create directory for demo app
+  tags:
+    - ipa-wwwdemo
+  file:
+    path=/srv/www/demo/ui
+    state=directory
+    mode=0755
+    owner=root
+    group=root
+    seuser=system_u
+    serole=object_r
+    setype=httpd_sys_content_t
+    selevel=s0
+
+- name: Copy Apache demo app files
+  tags:
+    - ipa-wwwdemo
+  copy:
+    src=ui/
+    dest=/srv/www/demo/ui/
+    mode=0644
+    directory_mode=0755
+    owner=root
+    group=root
+    seuser=system_u
+    serole=object_r
+    setype=httpd_sys_content_t
+    selevel=s0
+  notify:
+    - restart httpd
+  when: false
+
+- name: Copy Apache demo app files
+  tags:
+    - ipa-wwwdemo
+  synchronize:
+    src=ui/
+    dest=/srv/www/demo/ui/
+    owner=false
+    group=false
+    recursive=true
+    delete=true
+    times=true
+
+- name: Copy WSGI app for demo app
+  tags:
+    - ipa-wwwdemo
+  copy:
+    src=wsgi.py
+    dest=/srv/www/demo/wsgi.py
+    mode=0644
+    directory_mode=0755
+    owner=root
+    group=root
+    seuser=system_u
+    serole=object_r
+    setype=httpd_sys_content_t
+    selevel=s0
+  notify:
+    - restart httpd
+
+- name: Create helper scripts
+  tags:
+    - ipa-wwwdemo
+  template:
+    src={{ item }}
+    dest=/root/{{ item }}
+    mode=0750
+    owner=root
+    group=root
+  with_items:
+    - demostep.sh
+    - getcert.sh
+    - getkeytab.sh
+    - rekeycert.sh
+    - rmcert.sh
+    - ocsp.sh

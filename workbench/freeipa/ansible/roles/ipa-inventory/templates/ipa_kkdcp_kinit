@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+
+. "{{ ipa_data_dir }}/ipaenv_kkdcp"
+
+/usr/bin/kinit -c ${KRB5CCNAMEARMOR} -n
+/usr/bin/kinit -T ${KRB5CCNAMEARMOR} $@

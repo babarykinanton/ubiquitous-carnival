@@ -1,0 +1,215 @@
+---
+- include: extravars.yml
+
+# - debug: var=hostvars[inventory_hostname] verbosity=4
+# - debug: var=groups verbosity=4
+
+- name: Set SELinux state (aka make Dan happy or sad)
+  tags:
+    - common
+  selinux:
+    policy={{ selinux_policy }}
+    state={{ selinux_state }}
+
+# DNS / hosts
+- name: fix /etc/hosts
+  tags:
+    - common
+  template: src=etc_hosts dest=/etc/hosts
+
+- name: Set FQDN hostname
+  tags:
+    - common
+  hostname: name={{ ansible_fqdn }}
+
+# time zones
+- name: Get timedatectl information
+  tags:
+    - common
+  command: timedatectl
+  register: timedatectl
+  changed_when: false
+
+- name: Get timedatectl information
+  tags:
+    - common
+  changed_when: false
+  set_fact:
+     tz_utc: "{{ 'Time zone: UTC' not in timedatectl.stdout }}"
+
+- name: Set timezone to UTC
+  tags:
+    - common
+  command: timedatectl set-timezone UTC
+  when: not tz_utc
+
+# package manager
+- include: dnf.yml
+  when: dnf_package
+
+- include: yum.yml
+  when: not dnf_package
+
+  # copr
+- name: Install gpg command for COPR / rpm_key
+  tags:
+    - common
+    - package-install
+    - package-copr
+    - network
+  package: name={{ item }} state=present
+  with_items:
+   - gnupg
+   - gnupg2
+  when: package_install
+
+- name: Add GPG RPM keys for copr
+  tags:
+    - common
+    - package-install
+    - package-copr
+    - network
+  rpm_key: "key=https://copr-be.cloud.fedoraproject.org/results/{{ item }}/pubkey.gpg state=present"
+  with_items: "{{ coprs_enabled }}"
+  when: "{{ coprs_enabled and package_install }}"
+
+- name: Enable extra COPRs
+  tags:
+    - common
+    - package-install
+    - package-copr
+    - network
+  command: dnf copr enable -y {{ item }}
+  with_items: "{{ coprs_enabled }}"
+  when: "{{ coprs_enabled and package_install }}"
+
+- name: upgrade all packages
+  tags:
+    - common
+    - package-install
+    - package-upgrade
+    - network
+  package: name=* state=latest
+  when: package_upgrade and package_install
+
+# custom RPMs
+- name: Create directory for custom RPMS
+  tags:
+    - common
+    - custom-rpms
+  file: path=/vagrant/rpms state=directory mode=0755
+  changed_when: false
+  when: custom_rpms
+
+- name: Install rsync
+  tags:
+    - common
+    - custom-rpms
+    - package-install
+    - network
+  package: name=rsync state=present
+  when: package_install
+
+- name: Synchronize RPMs
+  tags:
+    - common
+    - custom-rpms
+  synchronize:
+    src={{ipa_rpm_dir}}/
+    dest=/vagrant/rpms/
+    delete=true
+    recursive=true
+    copy_links=true
+    rsync_opts="--exclude=README"
+    use_ssh_args=true
+  changed_when: false
+  when: custom_rpms
+
+- name: find custom RPMs
+  tags:
+    - common
+    - custom-rpms
+  command: find -L /vagrant/rpms \( -type f -and -name '*.rpm' \) -printf '%p '
+  register: custom_rpm_files
+  changed_when: false
+  when: custom_rpms
+
+- name: install custom RPMs
+  tags:
+    - common
+    - custom-rpms
+  command: yum install --allowerasing --best -y {{ custom_rpm_files.stdout }}
+  when: custom_rpms and custom_rpm_files.stdout
+
+- name: install selinux tools
+  tags:
+    - common
+    - package-install
+    - network
+  package: name={{ item }} state=present
+  with_items:
+   - libselinux-python
+   - selinux-policy
+  when: package_install
+
+# Firewall
+- name: install firewalld
+  tags:
+    - pki
+    - firewall
+    - package-install
+    - network
+  package: name={{ item }} state=present
+  with_items:
+    - firewalld
+    - python-firewall
+  when: package_install
+
+- name: check for firewalld
+  tags:
+    - common
+    - firewall
+  stat: path=/usr/sbin/firewalld
+  register: has_firewalld
+
+- name: Enable and start firewalld
+  tags:
+    - common
+    - firewall
+  service: name=firewalld enabled=yes state=started
+  when: has_firewalld.stat.exists
+
+- name: Open firewall ports elemental services
+  tags:
+    - common
+    - firewall
+  firewalld:
+    service={{ item }}
+    permanent=true
+    state=enabled
+    immediate=yes
+  with_items:
+    - ssh
+  when: has_firewalld.stat.exists
+
+# CPRNG
+- name: Install rng tools
+  tags:
+    - common
+    - package-install
+    - network
+  package: name=rng-tools state=present
+  when: package_install
+
+- name: Start the rngd service
+  tags:
+    - common
+  service: name=rngd enabled=yes state=started
+
+- name: tty-less sudo
+  tags:
+    - common
+  lineinfile: dest=/etc/sudoers
+              state=absent
+              regexp='^Defaults(\s+)requiretty(\s*)$'
+              validate='visudo -cf %s'

@@ -1,0 +1,226 @@
+---
+# workaround for https://pagure.io/freeipa/issue/6704
+- name: Stop Apache HTTPD to free port 8443 for installation
+  tags:
+    - ipaserver-master
+    - ipa-install
+  service:
+    name=httpd
+    state=stopped
+  when: not ipa.configured.server
+
+- name: Install FreeIPA master (5-7 minutes)
+  tags:
+    - ipaserver-master
+    - ipa-install
+  command: >
+    ipa-server-install -U
+    --realm {{ ipa.realm }}
+    --domain {{ ipa.domain }}
+    --hostname {{ ansible_fqdn }}
+    --ds-password {{ ipa_dm_password }}
+    --admin-password {{ ipa_admin_password }}
+    --ip-address {{ ansible_default_ipv4.address }}
+    --setup-dns
+    --mkhomedir
+    --ssh-trust-dns
+    --allow-zone-overlap
+    --reverse-zone={{ reversezone.reversezone }}
+    {{ '--forwarder=%s' % dns_forwarder['nameservers'][0] if enable_forwarders else '--no-forwarders' }}
+  when: not ipa.configured.server
+
+- name: Install KRA on FreeIPA master (2-3 minutes)
+  tags:
+    - ipaserver-master
+    - ipa-install
+  command: >
+    ipa-kra-install -U
+    -p {{ ipa_dm_password }}
+  when: not ipa.configured.kra
+
+- name: Update IPA facts
+  tags:
+    - ipaserver-master
+  ipa_facts: domain={{ ipa_domain }}
+
+# XXX workaround for race condition
+# KRA restarts LDAP, which disconnects bind-ldap plugin. The reconnect
+# interval is 60 seconds. A restart make sure named is working properly.
+- name: Make sure named-pkcs11 DNS is restarted
+  tags:
+    - ipaserver-master
+    - ipa-install
+  service: name=named-pkcs11 state=restarted
+  changed_when: false
+
+- name: wait for services to come up
+  tags:
+    - ipaserver-master
+    - ipa-install
+  wait_for: port={{ item }} delay=0 timeout=30
+  with_items:
+    - 53
+    - 88
+    - 464
+    - 749
+    - 389
+    - 636
+    - 80
+    - 443
+    - 8080
+    - 8443
+
+- name: Set ipv4_dns fact
+  tags:
+    - ipaserver-master
+    - ipa-install
+  set_fact: ipv4_dns="{{ hostvars[groups['ipaserver_master'][0]].ansible_default_ipv4.address }}"
+
+- name: Add replica to ipv4_dns fact
+  tags:
+    - ipaserver-master
+    - ipa-install
+  set_fact: ipv4_dns="{{ ipv4_dns }} {{ hostvars[groups['ipaserver_replica'][0]].ansible_default_ipv4.address }}"
+  when: install_ipa_replica
+
+- name: Use FreeIPA DNS, nmcli conn modify ipv4.dns
+  tags:
+    - ipaserver-master
+    - ipa-install
+  command: >
+    nmcli conn modify {{ hostvars[item].nm_conn }} ipv4.dns "{{ ipv4_dns }}"
+  delegate_to: "{{item}}"
+  with_items: "{{ ipa_hosts }}"
+  changed_when: false
+
+- name: Use FreeIPA DNS, nmcli conn modify ipv4.dns-search
+  tags:
+    - ipaserver-master
+    - ipa-install
+  command: >
+    nmcli conn modify {{ hostvars[item].nm_conn }} ipv4.dns-search {{ ipa.domain }}
+  delegate_to: "{{item}}"
+  with_items: "{{ ipa_hosts }}"
+  changed_when: false
+
+- name: Use FreeIPA DNS, nmcli conn modify ipv4.ignore-auto-dns
+  tags:
+    - ipaserver-master
+    - ipa-install
+  command: >
+    nmcli conn modify {{ hostvars[item].nm_conn }} ipv4.ignore-auto-dns yes
+  delegate_to: "{{item}}"
+  with_items: "{{ ipa_hosts }}"
+  changed_when: false
+
+- name: Restart NetworkManager to make DNS changes effective
+  tags:
+    - ipaserver-master
+    - ipa-install
+  service: name=NetworkManager state=restarted
+  delegate_to: "{{item}}"
+  with_items: "{{ ipa_hosts }}"
+  changed_when: false
+
+- name: Set sensible defaults
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="config-mod --defaultshell=/bin/bash"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+    ignore_already_exists=true
+
+- name: Set home directory to /export/home
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="config-mod --homedirectory=/export/home"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+  when: install_ipa_nfsserver
+
+- name: Set admin's home directory to /export/home/admin
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="user-mod admin --homedir=/export/home/admin"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+  when: install_ipa_nfsserver
+
+- name: Enable password and OTP loging
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="config-mod --user-auth-type=password --user-auth-type=otp"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+
+- name: Enable global DNS sync ptr
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="dnsconfig-mod --allow-sync-ptr=TRUE"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+
+- name: Enable DNS sync ptr
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="dnszone-mod {{ ipa.domain }}. --allow-sync-ptr=TRUE"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+
+- name: Enable reverse DNS sync ptr
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="dnszone-mod {{ reversezone.reversezone }} --allow-sync-ptr=TRUE"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+
+- name: Ensure that ipa-ca points to master
+  tags:
+    - ipaserver-master
+    - ipa-install
+  ipa:
+    args="dnsrecord-mod {{ ipa.domain }}. ipa-ca --a-rec={{ ansible_default_ipv4.address }}"
+    password="{{ ipa_admin_password }}"
+    ignore_no_modifications=true
+
+- name: signal FreeIPA master has been deployed
+  tags:
+    - ipaserver-master
+    - ipa-install
+  copy:
+    content="PKI playbook"
+    dest=/etc/ipa/MASTER_DEPLOYED
+
+- name: Fetch IPA ca.crt
+  tags:
+    - ipaserver-master
+    - ipa-install
+    - fetch
+  fetch:
+    src=/etc/ipa/ca.crt
+    dest={{ ipa_data_dir }}/ca.crt
+    flat=yes
+
+- name: Copy IPA ca.crt to all machines
+  tags:
+    - ipaserver-master
+    - ipa-install
+  copy:
+    src={{ ipa_data_dir }}/ca.crt
+    dest=/etc/pki/ipa-ca.crt
+  delegate_to: "{{item}}"
+  with_items: "{{ ipa_hosts }}"

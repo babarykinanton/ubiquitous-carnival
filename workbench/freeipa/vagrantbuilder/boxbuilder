@@ -1,0 +1,400 @@
+#!/usr/bin/python2
+from ConfigParser import ConfigParser
+import argparse
+import datetime
+import hashlib
+import json
+import glob
+import os
+import re
+import shutil
+import subprocess
+from xml.etree import ElementTree
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+BASE_PACKAGES = [
+    # Vagrant dependencies
+    'curl', 'openssh-server', 'rsync', 'which', 'yum-utils',
+    # Ansible dependencies
+    'gnupg', 'libselinux-python', 'python-firewall', 'python2', 'python2-dnf',
+    'sudo',
+    # extras
+    'java-headless', 'openssh-clients', 'openssl', 'psmisc', 'rng-tools',
+    'screen', 'tar', 'tmux', 'vim-enhanced',
+]
+
+DOGTAG_PACKAGES = [
+    '389-ds-base',
+    'pki-ca', 'pki-kra', 'pki-ocsp', 'pki-server', 'dogtag-pki-server-theme',
+]
+
+HTTPD_PACKAGES = [
+    'httpd', 'mod_auth_gssapi', 'mod_authnz_pam',
+    'mod_intercept_form_submit', 'mod_lookup_identity', 'libsss_simpleifp',
+    'sssd-dbus', 'mod_nss', 'mod_session', 'mod_wsgi'
+]
+
+IPSILON_PACKAGES = [
+    'ipsilon', 'ipsilon-client', 'ipsilon-saml2', 'ipsilon-openid',
+    'ipsilon-openidc', 'ipsilon-persona', 'ipsilon-authform',
+    'ipsilon-infosssd', 'ipsilon-tools-ipa', 'ipsilon-authgssapi',
+    'ipsilon-authfas', 'ipsilon-authpam'
+]
+
+SAMBA_PACKAGES = [
+    'samba', 'samba-client', 'sssd-libwbclient'
+]
+
+OCSERV_PACKAGES = [
+    'ocserv', 'openconnect', 'bridge-utils'
+]
+
+NFS_PACKAGES = [
+    'nfs-utils'
+]
+
+# On Fedora the canonical package names start with freeipa but have an
+# alternative name, too.
+IPA_PACKAGES = [
+    'ipa-client', 'ipa-server', 'ipa-server-dns', 'ipa-server-trust-ad'
+]
+
+# package names
+BASE_PKG_NAMES = ','.join(sorted(BASE_PACKAGES))
+DOGTAG_PKG_NAMES = ','.join(sorted(BASE_PACKAGES + DOGTAG_PACKAGES))
+FREEIPA_PGK_NAMES = ','.join(sorted(
+    BASE_PACKAGES + DOGTAG_PACKAGES + HTTPD_PACKAGES + IPSILON_PACKAGES +
+    SAMBA_PACKAGES + OCSERV_PACKAGES + NFS_PACKAGES + IPA_PACKAGES))
+
+# add package infos to json metadata
+PACKAGE_METADATA = [
+    '389-ds-base', 'pki-server', 'freeipa-server', 'ipa-server',
+    'ipsilon'
+]
+
+# remove old kernels
+REMOVE_KERNELS = "package-cleanup -y --oldkernels --count=1"
+
+# enable a copr
+COPR_ENABLE = "dnf copr enable -y {}"
+
+# We run the update manually because it sometimes fails to write to /dev/log
+PKGUPGRADE = "[ -x /usr/bin/dnf ] && dnf -y update || yum -y update"
+
+# common args for virt-builder and customize
+IMG_FORMAT = 'qcow2'
+VIRT_ARGS = [
+    # '--verbose',
+    '--format', IMG_FORMAT,
+    '--timezone', 'UTC',
+    '--run', 'scripts/vagrantsetup',
+    '--root-password', 'password:Secret123',
+    '--password', 'vagrant:password:vagrant',
+    # '--run-command', PKGUPGRADE,
+    '--update',
+]
+
+VAGRANT_FILE = """\
+Vagrant.configure('2') do |config|
+        config.vm.synced_folder ".", "/vagrant", type: "rsync"
+        config.vm.provider :libvirt do |libvirt|
+                libvirt.driver = 'kvm'
+                libvirt.connect_via_ssh = false
+                libvirt.username = 'root'
+                libvirt.storage_pool_name = 'default'
+        end
+end
+"""
+
+FLAVORS = {
+    'freeipa': [
+        '--uninstall', 'chrony',
+        '--install', FREEIPA_PGK_NAMES,
+        '--firstboot', 'scripts/ipa-firstboot',
+    ],
+    'freeipa46-copr': [
+        # FreeIPA 4.5 for Fedora 25+
+        '--run-command', COPR_ENABLE.format('@freeipa/freeipa-4-6'),
+        '--uninstall', 'chrony',
+        '--install', FREEIPA_PGK_NAMES,
+        '--firstboot', 'scripts/ipa-firstboot',
+    ],
+    'dogtag': [
+        '--install', DOGTAG_PKG_NAMES
+    ],
+}
+
+# os_version, suffix, extras
+PLATFORMS = {
+    'fedora27': ('fedora-27', 'f27', []),
+    'centos74': ('centos-7.4', 'centos74', [
+        '--install', 'epel-release',
+        '--copy-in', 'scripts/puiterwijk-ipsilon-epel-7.repo:/etc/yum.repos.d/',
+    ]),
+    # 'rhel74': ('rhel-7.4', 'rhel74', []),
+}
+
+
+def trimbox(args, baseimage=False):
+    """Remove temporary files, logs and sparsify image
+    """
+    filename = args.boxworkfile if not baseimage else args.baseimage
+    # keep ~vagrant/.ssh
+    subprocess.check_call(
+        ['virt-sysprep',
+         '--operations', 'defaults,-ssh-userdir',
+         '-a', filename]
+    )
+    subprocess.check_call(
+        ['virt-sparsify', '--in-place', filename]
+    )
+
+
+def remove_kernels(args, baseimage=False):
+    """Remove old kernels
+
+    dnf/yum doesn't remove the currently running Kernel. Boot the image a
+    second time to remove the previous Kernel.
+    """
+    filename = args.boxworkfile if not baseimage else args.baseimage
+    subprocess.check_call(
+        ['virt-customize',
+         '--format', IMG_FORMAT,
+         '--run-command', REMOVE_KERNELS,
+         '-a', filename]
+    )
+
+
+def virt_builder(args):
+    """Base base image with base packages
+    """
+    cmd = ['virt-builder']
+    cmd.extend(VIRT_ARGS)
+    cmd.extend(['--install', BASE_PKG_NAMES])
+    cmd.extend([args.os_version, '--output', args.baseimage])
+    subprocess.check_call(cmd)
+    trimbox(args, baseimage=True)
+
+
+def virt_update_base(args):
+    cmd = ['virt-customize']
+    cmd.extend(VIRT_ARGS)
+    cmd.extend(['-a', args.baseimage])
+    subprocess.check_call(cmd)
+    trimbox(args, baseimage=True)
+
+
+def virt_customize(args):
+    cmd = ['virt-customize']
+    cmd.extend(VIRT_ARGS)
+    cmd.extend(args.extra_commands)
+    # another update in case extra_commands adds coprs
+    cmd.append('--update')
+    # enforce SELinux relabeling
+    cmd.append('--selinux-relabel')
+    cmd.extend(['-a', args.boxworkfile])
+    subprocess.check_call(cmd)
+
+
+def get_metadata(args):
+    xml = subprocess.check_output(
+        ['virt-inspector', '-a', args.boxworkfile]
+    )
+    with open(args.boxxml, 'w') as f:
+        f.write(xml)
+
+    info = subprocess.check_output(
+        ['qemu-img', 'info', args.boxworkfile]
+    )
+    mo = re.search('virtual\ size:.*\((\d+)\ bytes\)', info)
+    boxsize = int(mo.group(1))
+    mo = re.search('disk\ size:\s*(.*)', info)
+    disksize = mo.group(1)
+
+    et = ElementTree.parse(args.boxxml)
+    args.metadata.update({
+        "provider": "libvirt",
+        "format": IMG_FORMAT,
+        "virtual_size": int(round(boxsize / 1024.**3)),
+        # extra stuff
+        "name": args.boxname,
+        "file": os.path.basename(args.boxarchive),
+        "expand": et.find('./operatingsystem[0]/root[0]').text,
+        "arch": et.find('./operatingsystem[0]/arch[0]').text,
+        "osinfo": et.find('./operatingsystem[0]/product_name[0]').text,
+        "virtual_size_bytes": boxsize,
+        "disksize": disksize,
+        "checksum": {},
+        "packages": {},
+        "buildstamp": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S'),
+    })
+
+    xpath = "./operatingsystem[0]/applications/application[name='{}']"
+    for name in PACKAGE_METADATA:
+        node = et.find(xpath.format(name))
+        if node is None:
+            continue
+        version = node.find('version').text
+        release = node.find('release').text
+        args.metadata['packages'][name] = '-'.join((version, release))
+
+    with open(args.boxjson, 'w') as f:
+        json.dump(args.metadata, f, sort_keys=True, indent=4)
+
+
+def update_metadata(args):
+    h = hashlib.sha512()
+    with open(args.boxarchive, 'rb') as f:
+        while True:
+            data = f.read(1024**2)
+            if not data:
+                break
+            h.update(data)
+    args.metadata['checksum']['sha512'] = h.hexdigest()
+    args.metadata["compressed_size"] = os.path.getsize(args.boxarchive)
+
+    with open(args.boxjson, 'w') as f:
+        json.dump(args.metadata, f, sort_keys=True, indent=4)
+
+
+def compress_boxfile(args):
+    try:
+        os.unlink(args.boxarchive)
+    except OSError:
+        pass
+
+    with open(os.path.join(args.tmpdir, 'Vagrantfile'), 'w') as f:
+        f.write(VAGRANT_FILE)
+    shutil.copyfile(args.boxjson, os.path.join(args.tmpdir, 'metadata.json'))
+
+    # use shell here to use parallel xz
+    cmd = "tar cv ./metadata.json ./Vagrantfile ./box.img | xz -4 -T0 > {0.boxarchive}".format(args)
+    subprocess.check_call(cmd, shell=True, cwd=args.tmpdir)
+    os.unlink(args.boxworkfile)
+    os.unlink(os.path.join(args.tmpdir, 'metadata.json'))
+    os.unlink(os.path.join(args.tmpdir, 'Vagrantfile'))
+
+
+def build_index():
+    outputdir = os.path.join(HERE, 'output')
+    jsons = glob.glob(os.path.join(outputdir, '*.json'))
+    if not jsons:
+        return
+
+    cfg = ConfigParser()
+    keys = ['name', 'osinfo', 'arch', 'file', 'format', 'compressed_size',
+            'expand']
+    checksums = {}
+
+    for filename in sorted(jsons):
+        with open(filename) as f:
+            metadata = json.load(f)
+        section = metadata['name']
+        cfg.add_section(section)
+        for key in keys:
+            cfg.set(section, key, metadata[key])
+        cfg.set(section, 'size', metadata['virtual_size_bytes'])
+        checksum = metadata['checksum']['sha512']
+        cfg.set(section, 'checksum[sha512]', checksum)
+        checksums[metadata['file']] = checksum
+        notes = ', '.join(
+            sorted(': '.join((k, v)) for k, v in metadata['packages'].items())
+        )
+        cfg.set(section, 'notes', notes)
+
+    with open(os.path.join(outputdir, 'index'), 'w') as f:
+        cfg.write(f)
+    with open(os.path.join(outputdir, 'SHA512SUM'), 'w') as f:
+        for filename, checksum in sorted(checksums.iteritems()):
+            f.write('{}  {}\n'.format(checksum, filename))
+    return cfg
+
+
+def parseargs():
+    parser = argparse.ArgumentParser(description='vagrant boxbuilder.')
+    parser.add_argument('flavor', choices=sorted(FLAVORS))
+    parser.add_argument('platform', choices=sorted(PLATFORMS))
+    parser.add_argument('--update-base', action='store_true',
+                        help='Update base box')
+
+    args = parser.parse_args()
+
+    args.os_version, args.suffix, extras = PLATFORMS[args.platform]
+    args.extra_commands = []
+    # platform extras first, e.g. for epel-release
+    args.extra_commands.extend(extras)
+    args.extra_commands.extend(FLAVORS[args.flavor])
+
+    args.tmpdir = os.path.join(HERE, 'tmp')
+    args.baseboxdir = os.path.join(HERE, 'basebox')
+    args.outputdir = os.path.join(HERE, 'output')
+
+    args.boxname = '{0.flavor}-{0.suffix}'.format(args)
+    args.boxarchive = '{0.outputdir}/{0.boxname}.box'.format(args)
+
+    args.boxxml = '{0.outputdir}/{0.boxname}.xml'.format(args)
+    args.boxjson = '{0.outputdir}/{0.boxname}.json'.format(args)
+    args.metadata = {}  # to be filled later
+
+    args.boxworkfile = '{0.tmpdir}/box.img'.format(args)
+
+    args.baseimage = '{0.baseboxdir}/basebox-{0.os_version}.img'.format(args)
+
+    return parser, args
+
+
+def main():
+    build_index()
+    parser, args = parseargs()
+
+    # be nicer
+    subprocess.check_call(['ionice', '-c2', '-n7', '-p', str(os.getpid())])
+    subprocess.check_call(['renice', '+5', str(os.getpid())])
+
+    for directory in args.tmpdir, args.baseboxdir, args.outputdir:
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+
+    if not os.path.isfile(args.baseimage):
+        print("Create Vagrant basebox {0.baseimage}".format(args))
+        try:
+            virt_builder(args)
+        except Exception:
+            os.unlink(args.baseimage)
+            raise
+    elif args.update_base:
+        print("Updating Vagrant basebox {0.baseimage}".format(args))
+        try:
+            virt_update_base(args)
+        except Exception:
+            os.unlink(args.baseimage)
+            raise
+
+    print("Copy {0.baseimage} to {0.boxworkfile}".format(args))
+    shutil.copyfile(args.baseimage, args.boxworkfile)
+
+    print("Customize with extra packages and updates")
+    virt_customize(args)
+    print("Remove old kernels")
+    remove_kernels(args)
+    print("Trim box")
+    trimbox(args)
+
+    print("Get box metadata")
+    get_metadata(args)
+    print("Creating box archive")
+    compress_boxfile(args)
+    print("Update metadata")
+    update_metadata(args)
+    print("Rebuilding index")
+    build_index()
+
+    print("Done. To use the new box, run:")
+    print("    vagrant box add cheimes/{0.boxname} {0.boxarchive}".format(args))
+    print("You may remove {0.boxarchive} afterwards.".format(args))
+
+
+if __name__ == '__main__':
+    main()

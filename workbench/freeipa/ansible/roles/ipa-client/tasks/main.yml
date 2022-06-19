@@ -1,0 +1,37 @@
+---
+- name: Create /export home directory with correct context
+  tags:
+    - ipa-client
+    - ipa-install
+  file:
+    path=/export
+    state=directory
+    owner=root
+    group=root
+    mode=0755
+    seuser=system_u
+    serole=object_r
+    setype=home_root_t
+    selevel=s0
+  when: install_ipa_nfsserver
+
+- name: join FreeIPA
+  tags:
+    - ipa-client
+    - ipa-install
+  command: >
+    ipa-client-install -U
+    --realm {{ ipa.realm }}
+    --domain {{ ipa.domain }}
+    --principal admin
+    --password {{ ipa_admin_password }}
+    --ca-cert-file /etc/pki/ipa-ca.crt
+    --force-join
+    --mkhomedir
+    --ssh-trust-dns
+  when: not ipa.configured.client
+
+- name: Update IPA facts
+  tags:
+    - ipa-client
+  ipa_facts: domain={{ ipa_domain }}

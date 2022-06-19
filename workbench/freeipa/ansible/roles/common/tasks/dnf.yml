@@ -1,0 +1,41 @@
+---
+- name: Disable dnf repos to prevent network access
+  tags:
+    - common
+  command: dnf config-manager --set-disabled {{ item }}
+  with_items:
+    - fedora
+    - updates
+  when: not enable_network
+  changed_when: false
+
+- name: Enable dnf repos
+  tags:
+    - common
+  command: dnf config-manager --set-enabled {{ item }}
+  with_items:
+    - fedora
+    - updates
+  when: enable_network
+  changed_when: false
+  failed_when: false
+
+- name: Auto select fastest DNF mirror
+  tags:
+    - common
+    - package-install
+  ini_file: dest=/etc/dnf/dnf.conf
+            section=main
+            option=fastestmirror
+            value=1
+            backup=yes
+
+- name: Enable yum for Fedora
+  tags:
+    - common
+    - package-install
+    - network
+  command: dnf install yum-utils -y
+  args:
+    creates: /usr/bin/yumdownloader
+  when: package_install

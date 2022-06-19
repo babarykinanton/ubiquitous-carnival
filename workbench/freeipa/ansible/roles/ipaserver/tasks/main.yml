@@ -1,0 +1,29 @@
+---
+- name: install FreeIPA server package (RHEL / CentOS)
+  tags:
+    - ipaserver
+    - package-install
+    - network
+  package: name={{ item }} state=present
+  with_items:
+    - bind-pkcs11
+    - bind-pkcs11-utils
+    - bind-dyndb-ldap
+    - ipa-server
+    - ipa-server-dns
+  when: package_install
+
+- name: Open Firewall for services
+  tags:
+    - ipaserver
+    - firewall
+  firewalld:
+    service={{ item }}
+    permanent=true
+    state=enabled
+    immediate=yes
+  with_items:
+    - freeipa-ldap
+    - freeipa-ldaps
+    - dns
+  when: has_firewalld.stat.exists

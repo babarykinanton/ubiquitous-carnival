@@ -1,0 +1,7 @@
+---
+- name: install Dogtag PKI CA
+  hosts: pki_server
+  roles:
+    - pki-ca
+    - pki-kra
+

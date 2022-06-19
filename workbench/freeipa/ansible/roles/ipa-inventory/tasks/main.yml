@@ -1,0 +1,198 @@
+---
+- name: Create Firefox prefs
+  tags:
+    - ipa-inventory
+    - ipa-install
+  template: src=firefox_prefs dest=/etc/ipa/prefs.js
+  run_once: true
+
+- name: Create Firefox bookmarks
+  tags:
+    - ipa-inventory
+    - ipa-install
+  template: src=bookmarks.html dest=/etc/ipa/bookmarks.html
+  run_once: true
+
+- name: Fetch Firefox files
+  tags:
+    - ipa-inventory
+    - ipa-install
+    - fetch
+  fetch:
+    src=/etc/ipa/{{ item }}
+    dest={{ ipa_data_dir }}/{{ item }}
+    flat=yes
+  with_items:
+    - prefs.js
+    - bookmarks.html
+  run_once: true
+
+- name: Copy local Firefox files
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    copy
+    src={{ item }}
+    dest={{ ipa_data_dir }}/{{ item }}
+  with_items:
+    - xulstore.json
+  run_once: true
+
+# ipa-vpnserver creates another krb5 config for KKDCP
+- name: Write custom krb5.conf
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    template
+    src=krb5.conf
+    dest={{ ipa_data_dir }}/krb5.conf
+
+- name: Write custom krb5.conf for MS-KKDCP
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    template
+    src=krb5.conf
+    dest={{ ipa_data_dir }}/krb5_kkdcp.conf
+  vars:
+      use_kkdcp: True
+
+- name: Fetch resolv.conf
+  tags:
+    - ipa-inventory
+    - ipa-install
+    - fetch
+  fetch:
+    src=/etc/resolv.conf
+    dest={{ ipa_data_dir }}/resolv.conf
+    flat=yes
+
+- name: Fetch IPA ca.crt
+  tags:
+    - ipa-inventory
+    - ipa-install
+    - fetch
+  fetch:
+    src=/etc/ipa/ca.crt
+    dest={{ ipa_data_dir }}/ca.crt
+    flat=yes
+
+- name: Fetch ipa default.conf
+  tags:
+    - ipa-inventory
+    - ipa-install
+    - fetch
+  fetch:
+    src=/etc/ipa/default.conf
+    dest={{ ipa_data_dir }}/default.conf
+    flat=yes
+
+- name: Fetch kra agent pem file
+  tags:
+    - ipa-inventory
+    - ipa-install
+    - fetch
+  fetch:
+    src=/etc/httpd/alias/kra-agent.pem
+    dest={{ ipa_data_dir }}/kra-agent.pem
+    flat=yes
+
+- name: Template local scripts
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    template
+    src={{ item }}
+    dest={{ ipa_script_dir }}/{{ item }}
+    mode=0755
+  with_items:
+    - ipa_firefox
+    - ipa_kinit
+    - ipa_kkdcp_kinit
+    - ipa_ssh
+    # Handled by ipa-vpnserver
+    # - ipa_kkdcp_openconnect_kinit
+    # - ipa_kkdcp_openconnect_vpn
+  run_once: true
+
+- name: Template local inventory files
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    template
+    src={{ item }}
+    dest={{ ipa_data_dir }}/{{ item }}
+    mode=0644
+  with_items:
+    - ipa_ssh_config
+    - ipaenv
+    - ipaenv_kkdcp
+    # Handled by ipa-vpnserver
+    # - ipaenv_kkdcp_openconnect
+  run_once: true
+
+- name: Check for NSSDB
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    stat
+    path={{ ipa_data_dir }}/nssdb
+  register: nssdb
+  run_once: true
+
+- name: Create NSSDB directory
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    file
+    dest={{ ipa_data_dir }}/nssdb
+    state=directory
+  run_once: true
+  when: not nssdb.stat.exists
+
+- name: Create NSSDB
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    command
+    certutil -N -d '{{ ipa_data_dir }}/nssdb' --empty-password
+  run_once: true
+  when: not nssdb.stat.exists
+
+- name: Remove old CA.crt from NSSDB
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    command
+    certutil -D -d '{{ ipa_data_dir }}/nssdb' -n 'IPA CA'
+  when: nssdb.stat.exists
+  failed_when: false
+
+- name: Populate NSSDB with CA.crt
+  tags:
+    - ipa-inventory
+    - ipa-install
+  become: no
+  local_action:
+    command
+    certutil -A -d '{{ ipa_data_dir }}/nssdb' -n 'IPA CA' -i '{{ ipa_data_dir }}/ca.crt' -t 'TC,C,T'
+  run_once: true
+  # no when, always add cert

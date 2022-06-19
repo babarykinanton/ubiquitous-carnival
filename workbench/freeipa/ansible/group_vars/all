@@ -1,0 +1,30 @@
+---
+ansible_ssh_port: 22
+
+ipa_domain: "{{ ansible_domain }}"
+ipa_dm_password: "DMSecret456"
+ipa_admin_password: "Secret123"
+use_kkdcp: false
+http_keytab: /etc/httpd/conf/http.keytab
+# all hosts except localhost
+ipa_hosts: "{{ groups['all'] | difference(['localhost']) }}"
+
+ipa_data_dir: "{{ inventory_dir }}/ipadata"
+ipa_script_dir: "{{ ipa_data_dir }}/bin"
+ipa_rpm_dir: "{{ ipa_data_dir }}/rpms"
+ipa_firefox_dir: "{{ ipa_data_dir }}/firefox"
+
+#
+# User options
+# ------------
+#
+#coprs_enabled:
+# - "@freeipa/freeipa-4-3"
+custom_rpms: false
+package_install: true
+package_upgrade: false
+selinux_state: enforcing
+selinux_policy: targeted
+enable_packages: true
+enable_network: true
+enable_forwarders: "{{ enable_network }}"
